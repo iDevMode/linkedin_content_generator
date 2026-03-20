@@ -6,14 +6,16 @@ Scrapes multiple sources for AI agent / agentic workflow stories and development
 filtering out general tech noise. Outputs a ranked list of topics relevant to
 Nukode's positioning as an authority on agentic workflows and chatbots.
 
-Sources (priority order, no-API-key sources first):
+Sources (priority order):
+  - Perplexity (AI-powered web search — requires PERPLEXITY_API_KEY)
   - HackerNews (public API)
   - RSS feeds (AI-focused blogs and publications)
   - Reddit (r/artificial, r/MachineLearning, etc. — requires API key)
 
 Usage:
   python execution/scrape_trending_topics.py
-  python execution/scrape_trending_topics.py '{"max_topics": 10, "sources": ["hackernews", "rss", "reddit"]}'
+  python execution/scrape_trending_topics.py '{"max_topics": 10, "sources": ["perplexity"]}'
+  python execution/scrape_trending_topics.py '{"max_topics": 10, "sources": ["perplexity", "hackernews", "rss"]}'
 """
 
 import json
@@ -67,6 +69,102 @@ def is_agent_relevant(title: str, summary: str = "") -> bool:
     """Check if content is relevant to AI agents / agentic workflows."""
     text = f"{title} {summary}".lower()
     return any(kw in text for kw in AGENT_KEYWORDS)
+
+
+def scrape_perplexity(max_topics: int = 10) -> List[Dict]:
+    """Search for trending AI agent topics using the Perplexity API (sonar model with web search)."""
+    topics = []
+
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not api_key:
+        print("[INFO] PERPLEXITY_API_KEY not set — skipping Perplexity search.", file=sys.stderr)
+        return topics
+
+    try:
+        resp = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "sonar",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a JSON API. You ONLY output valid JSON arrays. "
+                            "No explanations, no markdown, no commentary. "
+                            "If you cannot find enough results, return as many as you can."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Return exactly {max_topics} recent news stories about AI agents "
+                            "and agentic workflows from the past week as a JSON array.\n\n"
+                            "Topics: multi-agent systems, AI automation, agent frameworks, "
+                            "tool-use, function calling, RAG, autonomous workflows, "
+                            "enterprise AI deployments, agentic AI.\n\n"
+                            "Output ONLY this JSON array, nothing else:\n"
+                            f'[{{"title":"headline","summary":"2-3 sentences","url":"source url"}}] '
+                            f"(repeat {max_topics} times)"
+                        ),
+                    },
+                ],
+                "max_tokens": 2000,
+                "temperature": 0.2,
+                "search_recency_filter": "week",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        citations = data.get("citations", [])
+
+        # Parse the JSON response from Perplexity
+        # Strip markdown code fences if present
+        clean = content.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```(?:json)?\s*", "", clean)
+            clean = re.sub(r"\s*```$", "", clean)
+
+        parsed_topics = json.loads(clean)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for i, item in enumerate(parsed_topics):
+            title = item.get("title", "")
+            summary = item.get("summary", "")
+            url = item.get("url", "")
+
+            # Fall back to citation URLs if the model didn't include one
+            if not url and citations and i < len(citations):
+                url = citations[i]
+
+            topics.append({
+                "title": title,
+                "url": url,
+                "source": "perplexity",
+                "score": max_topics - i,  # Rank order from Perplexity
+                "timestamp": now_iso,
+                "summary": summary,
+                "engagement": max_topics - i,
+            })
+
+        print(f"[INFO] Perplexity returned {len(topics)} topics.", file=sys.stderr)
+
+    except json.JSONDecodeError as e:
+        print(f"[WARN] Failed to parse Perplexity response as JSON: {e}", file=sys.stderr)
+        print(f"[DEBUG] Raw response: {content[:500]}", file=sys.stderr)
+    except requests.RequestException as e:
+        print(f"[WARN] Perplexity API request failed: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[WARN] Perplexity scrape failed: {e}", file=sys.stderr)
+
+    return topics
 
 
 def scrape_hackernews(max_items: int = 50) -> List[Dict]:
@@ -267,7 +365,9 @@ def score_topic(topic: Dict) -> float:
 
     # Source priority bonus
     source = topic.get("source", "")
-    if "hackernews" in source:
+    if "perplexity" in source:
+        score += 5
+    elif "hackernews" in source:
         score += 3
     elif "reddit" in source:
         score += 2
@@ -307,7 +407,7 @@ def main(sources: Optional[List[str]] = None, max_topics: int = 15) -> dict:
     Run the full scraping pipeline.
 
     Args:
-        sources: List of sources to scrape. Options: "hackernews", "rss", "reddit".
+        sources: List of sources to scrape. Options: "perplexity", "hackernews", "rss", "reddit".
                  Defaults to all available sources.
         max_topics: Maximum number of topics to return.
 
@@ -315,12 +415,18 @@ def main(sources: Optional[List[str]] = None, max_topics: int = 15) -> dict:
         dict with status, data (list of scored topics), and metadata.
     """
     if sources is None:
-        sources = ["hackernews", "rss", "reddit"]
+        sources = ["perplexity", "hackernews", "rss", "reddit"]
 
     all_topics = []
     source_counts = {}
 
     print("[INFO] Starting AI agent topic scrape...", file=sys.stderr)
+
+    if "perplexity" in sources:
+        print("[INFO] Searching with Perplexity AI...", file=sys.stderr)
+        pplx_topics = scrape_perplexity(max_topics=max_topics)
+        source_counts["perplexity"] = len(pplx_topics)
+        all_topics.extend(pplx_topics)
 
     if "hackernews" in sources:
         print("[INFO] Scraping HackerNews...", file=sys.stderr)
